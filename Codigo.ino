@@ -1,32 +1,33 @@
-/********************* INCLUDES BÁSICOS (tu bloque requerido) *********************/
-#include <WiFi.h>          // Incluye la biblioteca WiFi para manejar la conexión a la red.
-#include <WebServer.h>     // Incluye la biblioteca WebServer para crear un servidor web.
-#include "Principal.h"     // Incluye el archivo que contiene el código HTML de la página principal. 
+/********************* INCLUDES BÁSICOS *********************/
+#include <WiFi.h>          // WiFi
+#include <WebServer.h>     // Servidor HTTP
+#include "Principal.h"     // Página de USUARIO (ruta "/")
+#include "Admin.h"         // Página de ADMIN    (ruta "/admin")
 
-const char* ssid     = "LABO";  // Define el nombre de la red WiFi a la que se conectará.
-const char* password = "";      // Define la contraseña de la red WiFi.
-WebServer server(80);           // Crea un objeto para el servidor web en el puerto 80.
-/*******************************************************************************/
+const char* ssid     = "LABO";
+const char* password = "";
+WebServer server(80);
+/************************************************************/
 
-/* ===== Resto de librerías de hardware ===== */
+/* ===== Librerías de hardware ===== */
 #include <SPI.h>
 #include <MFRC522.h>            // RFID RC522
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>  // LCD I2C
 #include <DHT.h>                // DHT11
 
-/********** CONSTANTES DE HARDWARE **********
- LCD I2C: VCC=5V, GND, SDA=GPIO21, SCL=GPIO22
+/********** Pines / Hardware **********
+ LCD I2C: VCC=5V/3V3, GND, SDA=GPIO21, SCL=GPIO22
  RFID RC522: VCC=3.3V, GND, RST=GPIO4, SDA=GPIO5, SCK=18, MOSI=23, MISO=19
  Sensor IR (egreso): OUT=GPIO34
  DHT11: DATA=GPIO14
- Motor paso a paso (28BYJ-48 + ULN2003): IN1=GPIO25, IN2=GPIO26, IN3=GPIO27, IN4=GPIO32
- Ventiladores (relevador o MOSFET): FAN1=GPIO12, FAN2=GPIO33
- ********************************************/
+ Motor 28BYJ-48 + ULN2003: IN1=GPIO25, IN2=GPIO26, IN3=GPIO27, IN4=GPIO32
+ Ventiladores (virtuales por ahora): FAN1=GPIO12, FAN2=GPIO33
+****************************************/
 
 #define CAPACITY_MAX     40
 
-// LCD I2C (dirección típica 0x27; cambiar a 0x3F si tu módulo usa esa)
+// LCD I2C (cambia 0x27 por 0x3F si tu módulo usa esa dirección)
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // RFID RC522 (SPI)
@@ -42,69 +43,62 @@ DHT dht(DHT_PIN, DHT_TYPE);
 // Sensor IR (egresos)
 #define IR_PIN    34
 
-// ======== LED RGB (DESHABILITADO) ========
-// Dejo TODO comentado para que no influya hasta que lo montes.
-// #define PIN_R     15
-// #define PIN_G      2
-// #define PIN_B     13
-// #define CH_R       0
-// #define CH_G       1
-// #define CH_B       2
-// #define PWM_FREQ 5000
-// #define PWM_RES     8
-// void setRGB(uint8_t r, uint8_t g, uint8_t b) {
-//   ledcWrite(CH_R, r);
-//   ledcWrite(CH_G, g);
-//   ledcWrite(CH_B, b);
-// }
-// void updateRGB(){
-//   // Cambiar color según estado (verde/amarillo/rojo)
-// }
-// =========================================
-
-// Motor paso a paso (cortina) – 28BYJ-48 con ULN2003 (half-step)
+// Motor paso a paso (28BYJ-48 + ULN2003) – secuencia half-step
 #define M_IN1 25
 #define M_IN2 26
 #define M_IN3 27
 #define M_IN4 32
 
-// Ventiladores
+// Ventiladores (virtuales)
 #define FAN1_PIN 12
 #define FAN2_PIN 33
 
-// Umbrales temperatura para ventiladores (histeresis)
-#define TEMP_ON_FAN   33.0
-#define TEMP_OFF_FAN  31.0
+/* ===== Ventiladores con umbrales de test =====
+   ON  a 26.0 °C
+   OFF a 25.0 °C
+   (histeresis 1 °C)
+*/
+#define TEMP_ON_FAN   26.0
+#define TEMP_OFF_FAN  25.0
 
-// Timings del ciclo automático
-const uint32_t T_INGRESO_MS = 5000;
-const uint32_t T_FUNCION_MS = 10000;
-const uint32_t T_RETIRO_MS  = 5000;
+/* ===== Timings del ciclo =====
+   ABIERTO  : 30 s  (telón cerrado)
+   EN FUNCIÓN: 35 s (telón abre y queda abierto)
+   ESPERA   : 30 s  (telón se cierra; salen)
+*/
+const uint32_t T_ABIERTO_MS  = 30000;
+const uint32_t T_FUNCION_MS  = 35000;
+const uint32_t T_ESPERA_MS   = 30000;
 
-/* ===== Estado del sistema ===== */
+/* ===== Estado general ===== */
 enum Estado { EST_ABIERTO, EST_EN_FUNCION, EST_CERRADO };
 Estado estado = EST_ABIERTO;
 
+/* ===== Fases del telón (orden ABIERTO → FUNCIÓN → ESPERA) ===== */
+enum Phase { PH_ABIERTO, PH_FUNCION, PH_ESPERA };
+Phase phase = PH_ABIERTO;
+uint32_t phaseStart = 0;
+
 volatile uint16_t ingresos = 0;  // suma RFID
 volatile uint16_t egresos = 0;   // suma IR
-float temperaturaC = 0.0;
-bool fansOn = false;
-String lcdLine = "Bienvenidos";
-String lcdLine2 = "Anfiteatro";
+float  temperaturaC = 0.0;
+float  humedadRel   = 0.0;
+bool   fansOn = false;
 
-/* ===== Cortina (stepper) ===== */
+// Mensaje temporal al pasar tarjeta
+uint32_t lcdMsgUntilMs = 0;
+
+// Bloqueo de egreso tras RFID (evita que la misma mano dispare el IR)
+uint32_t egresoBlockUntilMs = 0;
+const uint16_t BLOCK_EGRESO_MS = 3000;
+
+/* ===== Stepper (28BYJ-48) ===== */
 const uint8_t halfStep[8][4] = {
-  {1,0,0,0},
-  {1,1,0,0},
-  {0,1,0,0},
-  {0,1,1,0},
-  {0,0,1,0},
-  {0,0,1,1},
-  {0,0,0,1},
-  {1,0,0,1}
+  {1,0,0,0},{1,1,0,0},{0,1,0,0},{0,1,1,0},
+  {0,0,1,0},{0,0,1,1},{0,0,0,1},{1,0,0,1}
 };
-const uint16_t OPEN_STEPS = 2048;      // ajustar a tu carrera real
-const uint16_t STEP_INTERVAL_MS = 3;   // velocidad de paso
+const uint16_t OPEN_STEPS = 2048;    // Ajustar a tu carrera real
+const uint16_t STEP_INTERVAL_MS = 3; // Velocidad
 
 enum CurtainState { CURT_IDLE, CURT_OPENING, CURT_CLOSING };
 CurtainState curtState = CURT_IDLE;
@@ -118,39 +112,28 @@ void motorWriteStep(uint8_t idx){
   digitalWrite(M_IN3, halfStep[idx][2]);
   digitalWrite(M_IN4, halfStep[idx][3]);
 }
-void curtainOpenStart(){
-  curtState = CURT_OPENING;
-  curtStepsRemaining = OPEN_STEPS;
-}
-void curtainCloseStart(){
-  curtState = CURT_CLOSING;
-  curtStepsRemaining = OPEN_STEPS;
-}
+void curtainOpenStart(){  curtState = CURT_OPENING;  curtStepsRemaining = OPEN_STEPS; }
+void curtainCloseStart(){ curtState = CURT_CLOSING;  curtStepsRemaining = OPEN_STEPS; }
 void curtainTask(){
   if(curtState==CURT_IDLE) return;
   if(millis()-lastStepMs < STEP_INTERVAL_MS) return;
   lastStepMs = millis();
 
-  if(curtState==CURT_OPENING){
-    stepIndex = (stepIndex + 1) & 0x07;
-    motorWriteStep(stepIndex);
-  } else { // CLOSING
-    stepIndex = (stepIndex + 7) & 0x07;
-    motorWriteStep(stepIndex);
-  }
+  if(curtState==CURT_OPENING){ stepIndex = (stepIndex + 1) & 0x07; }
+  else                        { stepIndex = (stepIndex + 7) & 0x07; }
+  motorWriteStep(stepIndex);
+
   if(curtStepsRemaining>0) curtStepsRemaining--;
   if(curtStepsRemaining==0){
     curtState = CURT_IDLE;
     // desenergizar bobinas
-    digitalWrite(M_IN1, LOW);
-    digitalWrite(M_IN2, LOW);
-    digitalWrite(M_IN3, LOW);
-    digitalWrite(M_IN4, LOW);
+    digitalWrite(M_IN1, LOW); digitalWrite(M_IN2, LOW);
+    digitalWrite(M_IN3, LOW); digitalWrite(M_IN4, LOW);
   }
 }
 
-/* ===== IR – egresos (antirrebote) ===== */
-bool irLast = HIGH;         // segun módulo puede ser activo-bajo
+/* ===== IR – egresos (antirrebote + bloqueo post-RFID) ===== */
+bool irLast = HIGH;         // según módulo puede ser activo-bajo
 uint32_t irLastChange = 0;
 const uint16_t IR_DEBOUNCE_MS = 50;
 void readIR(){
@@ -159,66 +142,94 @@ void readIR(){
   if(v != irLast && (now - irLastChange) > IR_DEBOUNCE_MS){
     irLastChange = now;
     irLast = v;
-    // si es activo-bajo, contar en flanco a LOW:
-    if(v == LOW){
-      if(egresos < ingresos) egresos++;
+    if(v == LOW){ // flanco activo (corte del haz)
+      // Salidas permitidas siempre (respetando bloqueo e integridad)
+      if (now > egresoBlockUntilMs) {
+        if (egresos < ingresos) {
+          egresos++;
+          // Serial.println("[IR] Egreso contabilizado");
+        }
+      } else {
+        // Serial.println("[IR] Ignorado por bloqueo post-RFID");
+      }
     }
   }
 }
 
-/* ===== RFID – ingresos (antirepetición) ===== */
+/* ===== RFID – ingresos (sin anti-repetición, pero condicionado por fase) ===== */
 uint32_t lastRFIDMs = 0;
 const uint16_t RFID_PERIOD_MS = 50;
-uint8_t lastUID[10] = {0};
-byte lastUIDLen = 0;
-uint32_t lastUIDTime = 0;
-
-bool sameUID(MFRC522::Uid &uid){
-  if(uid.size != lastUIDLen) return false;
-  for(byte i=0;i<uid.size;i++) if(uid.uidByte[i] != lastUID[i]) return false;
-  return true;
-}
-void rememberUID(MFRC522::Uid &uid){
-  lastUIDLen = uid.size;
-  for(byte i=0;i<uid.size;i++) lastUID[i] = uid.uidByte[i];
-  lastUIDTime = millis();
-}
 void rfidTask(){
   if(millis()-lastRFIDMs < RFID_PERIOD_MS) return;
   lastRFIDMs = millis();
   if(!rfid.PICC_IsNewCardPresent()) return;
   if(!rfid.PICC_ReadCardSerial()) return;
 
-  if(sameUID(rfid.uid) && millis()-lastUIDTime < 2000){
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
-    return;
-  }
-  rememberUID(rfid.uid);
-  if(ingresos < CAPACITY_MAX) ingresos++;
+  // Entradas habilitadas solo en ABIERTO y EN FUNCIÓN
+  bool entradasHabilitadas = (phase == PH_ABIERTO) || (phase == PH_FUNCION);
 
-  rfid.PICC_HaltA();
-  rfid.PCD_StopCrypto1();
+  if(entradasHabilitadas && ingresos < CAPACITY_MAX){
+    egresoBlockUntilMs = millis() + BLOCK_EGRESO_MS;   // bloqueo egreso 3s
+    lcdMsgUntilMs = millis() + 3000;                   // mensaje 3s
+    Serial.println("[RFID] Tarjeta detectada");
+    ingresos++;
+  } else {
+    // Serial.println("[RFID] Entrada bloqueada (ESPERA/AFORO)");
+  }
+
+  rfid.PICC_HaltA(); rfid.PCD_StopCrypto1();
 }
 
-/* ===== DHT – temperatura + ventiladores ===== */
+/* ===== DHT – lectura + ventiladores (virtuales) ===== */
 uint32_t lastDHT = 0;
 const uint32_t DHT_PERIOD_MS = 2000;
 void tempTask(){
   if(millis()-lastDHT < DHT_PERIOD_MS) return;
   lastDHT = millis();
-  float t = dht.readTemperature();
-  if(!isnan(t)) temperaturaC = t;
 
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  if(!isnan(t)) temperaturaC = t;
+  if(!isnan(h)) humedadRel   = h;
+
+  // Log a serie (útil para ver thresholds)
+  if(!isnan(t)){
+    Serial.print("[TEMP] "); Serial.print(temperaturaC, 1);
+    Serial.print(" C  [HUM] "); Serial.print(humedadRel, 0); Serial.println(" %");
+  }
+
+  // Ventiladores con nuevos umbrales de test (reflejado en /status)
   if(temperaturaC >= TEMP_ON_FAN && !fansOn){
     fansOn = true;
-    digitalWrite(FAN1_PIN, HIGH);
-    digitalWrite(FAN2_PIN, HIGH);
+    digitalWrite(FAN1_PIN, HIGH); digitalWrite(FAN2_PIN, HIGH);
   } else if(temperaturaC < TEMP_OFF_FAN && fansOn){
     fansOn = false;
-    digitalWrite(FAN1_PIN, LOW);
-    digitalWrite(FAN2_PIN, LOW);
+    digitalWrite(FAN1_PIN, LOW);  digitalWrite(FAN2_PIN, LOW);
   }
+}
+
+/* ===== Utilidades de tiempo de fase ===== */
+uint32_t phaseDurationMs(){
+  switch(phase){
+    case PH_ABIERTO: return T_ABIERTO_MS;
+    case PH_FUNCION: return T_FUNCION_MS;
+    case PH_ESPERA:  return T_ESPERA_MS;
+  }
+  return 0;
+}
+uint32_t phaseRemainingMs(){
+  uint32_t elapsed = millis() - phaseStart;
+  uint32_t dur = phaseDurationMs();
+  return (elapsed >= dur) ? 0 : (dur - elapsed);
+}
+const char* phaseName(){
+  switch(phase){
+    case PH_ABIERTO: return "abierto";
+    case PH_FUNCION: return "funcion";
+    case PH_ESPERA:  return "espera";
+  }
+  return "desconocida";
 }
 
 /* ===== LCD ===== */
@@ -226,141 +237,137 @@ uint32_t lastLCD = 0;
 void lcdTask(){
   if(millis()-lastLCD < 250) return;
   lastLCD = millis();
+
+  // Mensaje temporal al pasar tarjeta
+  if(millis() < lcdMsgUntilMs){
+    lcd.clear();
+    lcd.setCursor(0,0); lcd.print("Pase,");
+    lcd.setCursor(0,1); lcd.print("disfrute la funcion");
+    return;
+  }
+
+  // Línea 1: estado
   lcd.setCursor(0,0);
   char l0[17];
-  if(estado==EST_EN_FUNCION) snprintf(l0, sizeof(l0), "EN FUNCION     ");
-  else if(estado==EST_ABIERTO) snprintf(l0, sizeof(l0), "ABIERTO        ");
-  else snprintf(l0, sizeof(l0), "CERRADO        ");
+  if(phase==PH_FUNCION)      snprintf(l0, sizeof(l0), "EN FUNCION     ");
+  else if(phase==PH_ESPERA)  snprintf(l0, sizeof(l0), "EN ESPERA      ");
+  else /* PH_ABIERTO */      snprintf(l0, sizeof(l0), "ABIERTO        ");
   lcd.print(l0);
 
+  // Línea 2: contador en FUNCION/ESPERA; T/H en ABIERTO
   lcd.setCursor(0,1);
   char l1[17];
-  uint16_t ocup = (uint16_t)max(0, min((int)CAPACITY_MAX, (int)ingresos - (int)egresos));
-  snprintf(l1, sizeof(l1), "T:%2.0fC IN:%02u", temperaturaC, (unsigned)ocup);
+  if (phase == PH_FUNCION || phase == PH_ESPERA) {
+    uint32_t rem = phaseRemainingMs();
+    uint16_t sec = rem / 1000;
+    uint8_t mm = sec / 60;
+    uint8_t ss = sec % 60;
+    snprintf(l1, sizeof(l1), "Queda %02u:%02u     ", mm, ss);
+  } else { // ABIERTO
+    snprintf(l1, sizeof(l1), "T:%2.0fC H:%2.0f%%   ", temperaturaC, humedadRel);
+  }
   lcd.print(l1);
 }
 
-/* ===== Ciclo automático 5-10-5 ===== */
-enum Phase { PH_INGRESO, PH_FUNCION, PH_RETIRO };
-Phase phase = PH_INGRESO;
-uint32_t phaseStart = 0;
-uint16_t targetOcup = 0;
-
+/* ===== Ocupación actual ===== */
 uint16_t ocupacionActual(){
   int val = (int)ingresos - (int)egresos;
   if(val < 0) val = 0;
   if(val > CAPACITY_MAX) val = CAPACITY_MAX;
   return (uint16_t)val;
 }
-void pickTarget(){
-  // objetivo entre 10 y 40 personas
-  targetOcup = 10 + (uint16_t)random(31); // 10..40 (31 valores: 0..30)
-  if(targetOcup > CAPACITY_MAX) targetOcup = CAPACITY_MAX;
-}
+
+/* ===== Ciclo del telón (solo mover en cambios de fase) ===== */
 void cycleInit(){
-  phase = PH_INGRESO;
+  phase = PH_ABIERTO;
   phaseStart = millis();
-  ingresos = 0; egresos = 0;
-  pickTarget();
   estado = EST_ABIERTO;
-  curtainCloseStart(); // cerrada al inicio
+
+  // Asegurar bobinas en reposo; NO mover el telón aquí.
+  curtState = CURT_IDLE; curtStepsRemaining = 0;
+  digitalWrite(M_IN1, LOW); digitalWrite(M_IN2, LOW);
+  digitalWrite(M_IN3, LOW); digitalWrite(M_IN4, LOW);
 }
+
 void cycleTask(){
   uint32_t now = millis();
   switch(phase){
-    case PH_INGRESO:{
+    case PH_ABIERTO:{
       estado = EST_ABIERTO;
-      // Llenar hacia target durante T_INGRESO_MS
-      static uint32_t lastIn = 0;
-      uint16_t ocup = ocupacionActual();
-      if(ocup < targetOcup){
-        if(now - lastIn > 200 && ingresos < CAPACITY_MAX){
-          ingresos++;
-          lastIn = now;
-        }
-      }
-      if(now - phaseStart >= T_INGRESO_MS){
-        phase = PH_FUNCION; phaseStart = now;
+      if(now - phaseStart >= T_ABIERTO_MS){
+        phase = PH_FUNCION;
+        phaseStart = now;
         estado = EST_EN_FUNCION;
-        curtainOpenStart(); // abrir cortina
+        curtainOpenStart(); // *** SOLO aquí abrimos el telón ***
       }
     }break;
 
     case PH_FUNCION:{
       estado = EST_EN_FUNCION;
       if(now - phaseStart >= T_FUNCION_MS){
-        phase = PH_RETIRO; phaseStart = now;
-        estado = EST_ABIERTO;
-        curtainCloseStart(); // cerrar cortina
+        phase = PH_ESPERA;
+        phaseStart = now;
+        estado = EST_ABIERTO; // (legacy) la fase indica ESPERA
+        curtainCloseStart();  // *** SOLO aquí cerramos el telón ***
       }
     }break;
 
-    case PH_RETIRO:{
-      estado = EST_ABIERTO;
-      // Vaciar a cero en T_RETIRO_MS
-      static uint32_t lastOut = 0;
-      if(now - lastOut > 150 && egresos < ingresos){
-        egresos++;
-        lastOut = now;
-      }
-      if(now - phaseStart >= T_RETIRO_MS){
-        cycleInit(); // reiniciar ciclo
+    case PH_ESPERA:{
+      estado = EST_ABIERTO;   // compat: estado visible “abierto”; fase=espera
+      if(now - phaseStart >= T_ESPERA_MS){
+        // Volvemos a ABIERTO; el telón ya quedó cerrado en el cambio anterior
+        phase = PH_ABIERTO;
+        phaseStart = now;
+        estado = EST_ABIERTO;
+        // NO mover telón aquí
       }
     }break;
   }
 }
 
-/* ===== HTTP – Handlers ===== */
+/* ===== JSON de estado ===== */
 String jsonStatus(){
   uint16_t ocup = ocupacionActual();
   uint8_t pct = (uint8_t)round((ocup * 100.0) / CAPACITY_MAX);
-  String st = (estado==EST_EN_FUNCION) ? "en-funcion" : (estado==EST_ABIERTO ? "abierto" : "cerrado");
 
-  // Si querés, podés incluir horarios aquí como arreglo JSON.
-  // Ejemplo: "horarios":[{"titulo":"Apertura","hora":"18:00"}, ...]
   String s = "{";
-  s += "\"estado\":\"" + st + "\",";
+  s += "\"estado\":\"" + String((phase==PH_FUNCION)?"en-funcion":"abierto") + "\","; // compat legacy
+  s += "\"fase\":\"" + String(phaseName()) + "\",";         // "abierto" | "funcion" | "espera"
+  s += "\"t_restante_ms\":" + String(phaseRemainingMs()) + ",";
   s += "\"temp\":" + String(temperaturaC, 1) + ",";
+  s += "\"hum\":"  + String(humedadRel, 0) + ",";
   s += "\"ingresos\":" + String(ingresos) + ",";
   s += "\"egresos\":" + String(egresos) + ",";
   s += "\"aforo_actual\":" + String(ocup) + ",";
   s += "\"aforo_max\":" + String(CAPACITY_MAX) + ",";
   s += "\"aforo_pct\":" + String(pct) + ",";
-  s += "\"fansOn\":" + String(fansOn ? "true" : "false") + ",";
-  s += "\"lcd\":\"" + lcdLine + "\"";
+  s += "\"fansOn\":" + String(fansOn ? "true" : "false");
   s += "}";
   return s;
 }
 
-void handleRoot(){
-  server.send(200, "text/html", MAIN_page); // MAIN_page viene de Principal.h
-}
+/* ===== Handlers HTTP ===== */
+void handleRoot(){  server.send(200, "text/html", MAIN_page); }   // Usuario (Principal.h)
+void handleAdmin(){ server.send(200, "text/html", ADMIN_page); }  // Admin   (Admin.h)
 void handleStatus(){
   String body = jsonStatus();
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", body);
 }
-void handleOpen(){
-  curtainOpenStart();
-  server.send(200, "application/json", "{\"ok\":true,\"action\":\"open\"}");
-}
-void handleClose(){
-  curtainCloseStart();
-  server.send(200, "application/json", "{\"ok\":true,\"action\":\"close\"}");
-}
-void handleLCD(){
-  if(server.hasArg("text")){
-    lcdLine = server.arg("text");
-  }
-  server.send(200, "application/json", "{\"ok\":true}");
-}
 void handleReset(){
-  ingresos = egresos = 0;
+  ingresos = 0;
+  egresos  = 0;
+  Serial.println("[ADMIN] Reset de aforo solicitado");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"action\":\"reset\"}");
 }
-void handleNotFound(){
-  server.send(404, "text/plain", "404");
+void handleOptions(){ // CORS simple por si lo necesitás
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers","Content-Type");
+  server.send(204);
 }
+void handleNotFound(){ server.send(404, "text/plain", "404"); }
 
 /* ========================== SETUP ========================== */
 void setup() {
@@ -368,10 +375,8 @@ void setup() {
 
   // GPIO básicos
   pinMode(IR_PIN, INPUT);
-  pinMode(M_IN1, OUTPUT);
-  pinMode(M_IN2, OUTPUT);
-  pinMode(M_IN3, OUTPUT);
-  pinMode(M_IN4, OUTPUT);
+  pinMode(M_IN1, OUTPUT); pinMode(M_IN2, OUTPUT);
+  pinMode(M_IN3, OUTPUT); pinMode(M_IN4, OUTPUT);
   digitalWrite(M_IN1, LOW); digitalWrite(M_IN2, LOW);
   digitalWrite(M_IN3, LOW); digitalWrite(M_IN4, LOW);
 
@@ -380,16 +385,11 @@ void setup() {
   digitalWrite(FAN1_PIN, LOW);
   digitalWrite(FAN2_PIN, LOW);
 
-  // ===== RGB deshabilitado =====
-  // // PWM RGB (LEDC)
-  // ledcSetup(CH_R, PWM_FREQ, PWM_RES); ledcAttachPin(PIN_R, CH_R);
-  // ledcSetup(CH_G, PWM_FREQ, PWM_RES); ledcAttachPin(PIN_G, CH_G);
-  // ledcSetup(CH_B, PWM_FREQ, PWM_RES); ledcAttachPin(PIN_B, CH_B);
-  // updateRGB();
-
   // LCD
-  Wire.begin(); // SDA=21, SCL=22 por defecto ESP32
-  lcd.init();
+  Wire.begin(21,22);
+  Wire.setClock(100000);
+  lcd.init();             // si tu lib no tiene init(), usar lcd.begin(16,2);
+  // lcd.begin(16,2);
   lcd.backlight();
   lcd.clear();
   lcd.setCursor(0,0); lcd.print("Inicializando");
@@ -403,49 +403,41 @@ void setup() {
   rfid.PCD_Init(SS_PIN, RST_PIN); // SDA=5, RST=4
   delay(50);
 
-  // Conexión a la red WiFi
-  WiFi.begin(ssid, password); // Inicia la conexión a la red WiFi con el SSID y la contraseña especificados.
-  while (WiFi.status() != WL_CONNECTED) { // Espera a que se establezca la conexión WiFi.
+  // WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println("\nConectado a la red WiFi.");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
 
   lcd.clear();
   lcd.setCursor(0,0); lcd.print("IP:");
   lcd.setCursor(0,1); lcd.print(WiFi.localIP().toString());
 
   // Rutas HTTP
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/status", HTTP_GET, handleStatus);
-  server.on("/curtain/open", HTTP_POST, handleOpen);
-  server.on("/curtain/close", HTTP_POST, handleClose);
-  server.on("/lcd", HTTP_POST, handleLCD);
-  server.on("/reset", HTTP_POST, handleReset);
+  server.on("/",         HTTP_GET,  handleRoot);    // Usuario
+  server.on("/admin",    HTTP_GET,  handleAdmin);   // Admin
+  server.on("/status",   HTTP_GET,  handleStatus);
+  server.on("/reset",    HTTP_POST, handleReset);   // Reset aforo (principal)
+  server.on("/reset",    HTTP_GET,  handleReset);   // Reset aforo (fallback)
+  server.on("/reset",    HTTP_OPTIONS, handleOptions);
   server.onNotFound(handleNotFound);
 
-  // Inicia el servidor web
   server.begin();
 
-  // Semilla para random (por si usás A0 libre; si no, comentar)
-  // randomSeed(analogRead(0));
-
-  // Inicia ciclo automático
+  // Iniciar ciclo
   cycleInit();
 }
 
 /* ========================== LOOP ========================== */
 void loop() {
   server.handleClient();
-  curtainTask();
-  rfidTask();
-  readIR();
-  tempTask();
-  lcdTask();
-  cycleTask();
-
-  // ===== RGB deshabilitado =====
-  // updateRGB();
+  curtainTask();  // mueve telón SOLO en transiciones
+  rfidTask();     // entradas (según fase)
+  readIR();       // salidas (siempre)
+  tempTask();     // DHT + ventiladores (virtual) + log
+  lcdTask();      // LCD con contador o Temp/Hum según fase
+  cycleTask();    // lógica de fases
 }
